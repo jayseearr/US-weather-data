@@ -1,0 +1,938 @@
+---
+title: "Weather Sandbox"
+author: "JR"
+date: "2024-02-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(tigris)
+```
+
+# Prologue
+If NOAA weather data has previously been downloaded and saved, run this code 
+to load:
+```{r}
+daily.data <- read.csv("us-climate-normals_2006-2020_v1.0.1_daily_multivariate_by-station_c20230404_processed1.csv")
+monthly.data <- read.csv("us-climate-normals_2006-2020_v1.0.1_monthly_multivariate_by-station_c20230404_processed1.csv")
+# load(zips, zcta.df, zip.station.distances.df, file = "weather-database-working-vars.RData")
+save(zips, zcta.df, zip.station.distances.df, file = "weather-database-working-vars.RData")
+```
+
+# Goals
+
+In this document, we're going to figure out how to get weather data from
+NOAA's online resources. The ultimate goal is to produce a function that takes
+a zip code as a parameter and returns the temperature profile (min/max temp
+data for each month or day of the year) and sunrise/sunset times.
+
+The first step will be to build a database of the following:
+- Average weather statistics for each day of the year, averaged over at least 15
+years, ending withing the last 5 years. Data should be available for each
+zip code in the US, or with similar granularity. If daily data is not available,
+monthly data is acceptable.
+- Statistics should include (with indicated priority)
+    * Min daily temperature (1)
+    * Max daily temperature (1)
+    * Some measure of "cloudiness" (2)
+    * Average daily temperature (3)
+    
+We'll also write a function that can calculate:
+- Sunrise/sunset data by location
+- Elevation angle of sun by location and time of day
+    
+# Resources
+
+NOAA's climate data is available here:
+https://www.ncei.noaa.gov/products/land-based-station/us-climate-normals
+
+The *Bulk Download* section has _Monthly_ and _Daily_ options (among others).
+
+The _Daily_ section has folders for 1981-2010, 1991-2020, and 2006-2020. We'll
+look at the most recent folder, 2006-2020. Here is the structure of the folder:
+Parent Directory	 		 
+1981-2010/	2021-04-01 21:10	 
+1991-2020/	2021-04-27 14:35	 
+2006-2020/	2021-04-27 14:35	 
+access/	    2017-04-04 13:01	 
+archive/	2017-04-04 13:00	 
+doc/	    2021-07-16 11:41
+
+The "access/" folder has CSV files named by station. Each of those files has
+a huge list of columns. The "archive/" folder has a zip file with the same files.
+
+In the 2006-2020 folder, there is a similar folder structure. The archive folder
+has a "...multivariate_by_station..." file that contains one file per station,
+each of which has a ton of columns. The ones we want are the first few, related
+to DLY-TAVG, DLY-TMAX, DLY-TMIN. Each of these variables has both NORMAL and
+STDDEV columns that contain mean and standard deviations of those variables.
+For an exerpt from the documentation describing the formatting of the file, see
+the appending below.
+
+The `meas_flag` and `comp_flag` columns note missing data, and how complete
+the record is (S & R completeness flags are pretty reliable).
+
+The archive file is here:
+https://www.ncei.noaa.gov/data/normals-daily/2006-2020/archive/us-climate-normals_2006-2020_v1.0.1_daily_multivariate_by-station_c20230404.tar.gz
+
+This file is huge, so we'll get rid of some of the columns.
+```{R}
+folder <- "/Users/jason/Downloads/us-climate-normals_2006-2020_v1.0.1_daily_multivariate_by-station_c20230404"
+station.files <- list.files(folder)
+daily.data <- NULL
+n = 1
+for (file in station.files) {
+    df <- as_tibble(read.csv(paste0(folder, "/",file))) %>%
+        select(STATION, DATE, LATITUDE, LONGITUDE, ELEVATION, NAME, month, day, 
+               contains(c("TMAX", "TMIN", "TAVG")))
+    for (col in colnames(df %>% select(starts_with("meas_flag_")))) {
+        nflags = sum(!sapply(df %>% select(col) %>% as.vector(), is.na))
+        if (nflags > 0) {
+            print(paste0("Warning! ", nflags, " meas_flags in column ", col))
+            print(paste0("  file: ", file))
+        }
+    }
+    df <- df %>% select(-contains(c("comp_flag", "meas_flag")))
+    if (is.null(daily.data)) daily.data <- df
+    else daily.data <- daily.data %>% bind_rows(df)
+    
+    if (n %% 1300 == 0) print(paste0(n/length(station.files)*100, "%"))
+    n = n + 1
+}
+```
+This creates a big data frame (like 5M rows, ~500MB); we'll save to CSV so we 
+don't have to reload every time. 
+
+We find that there are a lot of rows with NA values for avg/max/min temps.
+Unclear why this is. Filtering out the NA rows leave ~2 million rows.
+
+```{r}
+daily.data <- daily.data %>% filter(!is.na(DLY.TMAX.NORMAL))
+```
+
+```{r}
+write.csv(daily.data, 
+          "us-climate-normals_2006-2020_v1.0.1_daily_multivariate_by-station_c20230404_processed1.csv")
+```
+
+# Monthly Normals
+
+We can do the same thing for monthly normals (losing the `day` column, since
+it won't be meaningful). This should make a smaller data set.
+
+```{R}
+folder <- "/Users/jason/Downloads/us-climate-normals_2006-2020_v1.0.1_monthly_multivariate_by-station_c20230404"
+station.files <- list.files(folder)
+monthly.data <- NULL
+n = 1
+for (file in station.files) {
+    df <- as_tibble(read.csv(paste0(folder, "/",file))) %>%
+        select(STATION, DATE, LATITUDE, LONGITUDE, ELEVATION, NAME, month, 
+               contains(c("TMAX", "TMIN", "TAVG")))
+    for (col in colnames(df %>% select(starts_with("meas_flag_")))) {
+        nflags = sum(!sapply(df %>% select(col) %>% as.vector(), is.na))
+        if (nflags > 0) {
+            print(paste0("Warning! ", nflags, " meas_flags in column ", col))
+            print(paste0("  file: ", file))
+        }
+    }
+    df <- df %>% select(-contains(c("comp_flag", "meas_flag")))
+    if (is.null(monthly.data)) monthly.data <- df
+    else monthly.data <- monthly.data %>% bind_rows(df)
+    
+    if (n %% 1300 == 0) print(paste0(n/length(station.files)*100, "%"))
+    n = n + 1
+}
+```
+No warnings were thrown to indicate measurement flags (see Appendix). The data
+set has 161,664 rows and 65 variables. Many of those rows have NA temperature
+values. We'll filter them out (leaving ~64k rows) and save the resulting 
+dataframe to file for easy access.
+
+```{r}
+monthly.data <- monthly.data %>% filter(!is.na(MLY.TMAX.NORMAL))
+write.csv(monthly.data, "us-climate-normals_2006-2020_v1.0.1_monthly_multivariate_by-station_c20230404_processed1.csv")
+```
+
+This makes a 41MB file (not bad compared to >200MB for the original).
+
+# Zip Code Data
+
+The next step will be get get latitude/longitude data for all zip codes in the
+US, and determine the N nearest weather stations. Then compute temperature 
+normals for each zip code based on (1) nearest station, (2) nearest N stations,
+(3) nearest stations within X miles (max M stations). Multiple stations would
+probably be weighted by distance.
+
+Here is a Census source for zip code info:
+https://www.census.gov/cgi-bin/geo/shapefiles/index.php?year=2020&layergroup=ZIP+Code+Tabulation+Areas
+
+This file contains TIGER/Line shapefiles, which can be downloaded and parsed
+using the Tigris library, as below. Data should be for 2022.
+
+```{r}
+require(tigris)
+options(tigris_use_cache = TRUE) # use cached data if it exists on this computer
+zips <- zctas() # zips is an sf table with multipolygon data
+
+zcta.df <- tibble(zcta = zips$ZCTA5CE20, 
+                  latitude = as.numeric(zips$INTPTLAT20), 
+                  longitude = as.numeric(zips$INTPTLON20))
+```
+
+# Zip --> Temperature Profile Functionality
+
+To get the weather for an individual zip, we need to know which stations are 
+closest. This will most easily be accomplished by calculating distance between
+all zip centroids and station lat/lon values, and keeping the 10 (or so) 
+nearest. 
+
+We'll first define some functions for converting lat/lon to miles.
+```{r}
+dist_btwn_latlons <- function(lat1, lon1, lat2, lon2) {
+  # Convert latitude and longitude from degrees to radians
+  lat1 <- lat1 * pi / 180
+  lon1 <- lon1 * pi / 180
+  lat2 <- lat2 * pi / 180
+  lon2 <- lon2 * pi / 180
+  
+  # Haversine formula
+  # Radius of Earth in miles = 3959
+  distance <- 3959 * 2 * asin(sqrt(sin((lat2 - lat1) / 2)^2 + 
+      cos(lat1) * cos(lat2) * sin((lon2 - lon1) / 2)^2))
+  return(distance)
+}
+
+approx_dist_btwn_latlons <- function(lat1, lon1, lat2, lon2) {
+  # Convert latitude and longitude from degrees to radians
+  rad <- pi / 180
+  lat1 <- lat1 * rad
+  lon1 <- lon1 * rad
+  lat2 <- lat2 * rad
+  lon2 <- lon2 * rad
+  
+  # Earth's radius in miles
+  R <- 3959
+  # Distance based on the Pythagorean theorem
+  return(R * sqrt(((lat2 - lat1) * cos((lat1 + lat2) / 2))^2 + (lon2 - lon1)^2))
+}
+```
+
+Now create a matrix of latitudes and longitudes for the stations and the zip 
+codes. This will let us find the distance from each station to every zip 
+(and vice-versa). We'll keep only the 10 nearest stations for each zip code
+due to memory constraints, and clean up large variables as we go.
+The following code takes a minute or so to run.
+
+```{r}
+n.stations <- 10
+station.df <- monthly.data %>% 
+    group_by(STATION) %>%
+    summarize(latitude = first(LATITUDE),
+              longitude = first(LONGITUDE))
+
+# Create a distance matrix where d[i,j] is the distance from center of zcta i to
+# station j.
+lat1 <- matrix(data = rep(zcta.df$latitude, nrow(station.df)),
+               nrow=nrow(zcta.df), ncol=nrow(station.df))
+lat2 <- t(matrix(data = rep(station.df$latitude, nrow(zcta.df)),
+                 nrow=nrow(station.df), ncol=nrow(zcta.df)))
+lon1 <- matrix(data = rep(zcta.df$longitude, nrow(station.df)),
+               nrow=nrow(zcta.df), ncol=nrow(station.df))
+lon2 <- t(matrix(data = rep(station.df$longitude, nrow(zcta.df)),
+                 nrow=nrow(station.df), ncol=nrow(zcta.df)))
+
+#station.to.zip.dist <- approx_dist_btwn_latlons(lat1, lon1, lat2, lon2)
+station.to.zip.dist <- dist_btwn_latlons(lat1, lon1, lat2, lon2)
+rm(lat1, lat2, lon1, lon2)
+
+idx.closest.stations <- matrix(nrow=nrow(station.to.zip.dist), ncol=n.stations)
+dist.to.closest.stations <- matrix(nrow=nrow(station.to.zip.dist), ncol=n.stations)
+for (ir in seq_len(nrow(station.to.zip.dist))) {
+    idx <- order(station.to.zip.dist[ir,])[1:n.stations]
+    idx.closest.stations[ir,] <- idx
+    dist.to.closest.stations[ir,] <- station.to.zip.dist[ir,idx]
+}
+rm(station.to.zip.dist)
+
+idx.closest.stations <- idx.closest.stations %>% as_tibble()
+colnames(idx.closest.stations) <- gsub("^V", "I", colnames(idx.closest.stations))
+dist.to.closest.stations <- dist.to.closest.stations %>% as_tibble()
+colnames(dist.to.closest.stations) <- gsub("^V", "D", 
+                                           colnames(dist.to.closest.stations))
+zip.station.distances.df <- zcta.df %>% #select(zcta) %>% 
+    bind_cols(idx.closest.stations) %>% 
+    bind_cols(dist.to.closest.stations) %>% 
+    pivot_longer(cols = -c(zcta,latitude,longitude), 
+                 names_to = c("variable", "rank"), 
+                 names_pattern = "(.)(.*)", 
+                 values_to = "value") %>%
+    mutate(rank = as.numeric(rank), 
+           variable = if_else(variable == "I", "index", "distance")) %>%
+    arrange(zcta, rank)
+
+zip.station.distances.df <- zip.station.distances.df %>% 
+    pivot_wider(names_from = "variable", values_from = "value")
+```
+
+`zip.station.distances.df` now contains the index of the 10 nearest weather
+stations and the distance to that station (in miles). 
+Now we have to decide which stations to keep when determining a zip's weather. 
+Options include:
+
+1. Closest station only
+2. Closest N stations
+3. Stations within X miles
+4. All stations within Y% of the closest station (Y would be 150%-300%)
+5. Stations within the zip code in question
+
+The output should be a table of zip codes with station, the distance to that
+station, and the closeness rank (1 = closest).
+
+# Option 1 - Closest station
+This one is easy to implement:
+```{r}
+station.zip <- zip.station.distances.df %>% filter(rank == 1)
+station.zip <- station.zip %>%
+    mutate(station = station.df$STATION[station.zip$index])
+```
+
+# Option 2 - Closest N stations
+Also easy, we just have to pick N.
+```{r}
+N <- 5
+station.zip <- zip.station.distances.df %>% filter(rank <= N)
+station.zip <- station.zip %>%
+    mutate(station = station.df$STATION[station.zip$index])
+```
+
+# Option 3 - Stations within fixed radius
+
+```{r}
+R <- 50 # miles
+station.zip <- zip.station.distances.df %>% filter(distance <= R)
+station.zip <- station.zip %>%
+    mutate(station = station.df$STATION[station.zip$index])
+
+escapes = setdiff(zcta.df$zcta, station.zip$zcta)
+if (!is_empty(escapes)) {
+    warning(paste0(" *** ", length(escapes), 
+                   " zip codes do not have a station within ", R, " miles ***"))
+}
+```
+
+# Option 4 - Stations within variable radius
+```{r}
+multiple <- 3
+closest.stations <- zip.station.distances.df %>% filter(rank == 1) %>%
+    mutate(radius = multiple * distance)
+station.zip <- zip.station.distances.df %>%
+    left_join(closest.stations %>% select(zcta, radius), by="zcta") %>%
+    filter(distance <= radius) %>%
+    select(-radius)
+station.zip <- station.zip %>% 
+    mutate(station = station.df$STATION[station.zip$index])
+    
+```
+
+# Option 5 - Stations within each zip code
+This takes a while at the `st_intersects` step.
+```{r}
+require(sf)
+station.sf <- st_as_sf(station.df, 
+                       coords=c("longitude", "latitude"), crs = st_crs(zips))
+indices.within <- st_intersects(zips, station.sf)
+```
+
+Turns out that most zips have zero stations within them; only 12% have one, 
+1.5% have two, and 85% have zero. So this isn't a good way to match stations to
+zip codes. Should have realized this originally, since there are ~5800 unique
+stations and 38k zip codes (so at most only 15% of zips could have a station).
+
+# Maping Weather to Zip
+Once we have the zip.station table set up and filtered as we want it, we have
+a list of stations (up to 10) that are associated with each zip code. Now,
+let's do a trial of matching just the yearly min and max temperature normals
+to each area code.
+
+We are going to take the temperature data in `monthly.data` and merge it with
+the zip & station data in `station.zip`. The `month` column in `monthly.data` 
+is the month, and for now we'll just tax the max and min for each station.
+```{r}
+station.zip <- station.zip %>% 
+    rename(dist.rank = rank) %>%
+    select(-index) %>%
+    left_join(monthly.data %>% 
+                  select(STATION, DATE, NAME, month, MLY.TMAX.NORMAL, 
+                         MLY.TMIN.NORMAL, MLY.TMAX.STDDEV, MLY.TMIN.STDDEV),
+              by=join_by(station==STATION),
+              relationship = 'many-to-many') %>%
+    rename(zip.code = zcta)
+```
+
+We still (potentially) have some zip codes with more than one station associated
+with them. We can average them together either with equal weight or weighted
+by distance from the center of the zip code. This takes about 30 sec to 
+calculate the summaries.
+
+```{r}
+# Equally-weighted average
+temps.by.zip <- station.zip %>% 
+    group_by(zcta, month) %>%
+    summarize(latitude=first(latitude),
+              longitude=first(longitude),
+              station=paste0(station, collapse=" & "),
+              NAME=paste0(NAME, collapse=" & "),
+              MLY.TMAX.NORMAL = mean(MLY.TMAX.NORMAL),
+              MLY.TMIN.NORMAL = mean(MLY.TMIN.NORMAL),
+              MLY.TMAX.STDDEV = mean(MLY.TMAX.STDDEV),
+              MLY.TMIN.STDDEV = mean(MLY.TMIN.STDDEV)
+              )
+# Weighted by distance
+temps.by.zip <- station.zip %>% 
+    group_by(zcta, month) %>%
+    summarize(latitude=first(latitude),
+              longitude=first(longitude),
+              station=paste0(station, collapse=" & "),
+              NAME=paste0(NAME, collapse=" & "),
+              MLY.TMAX.NORMAL = weighted.mean(MLY.TMAX.NORMAL, 1/distance),
+              MLY.TMIN.NORMAL = weighted.mean(MLY.TMIN.NORMAL, 1/distance),
+              MLY.TMAX.STDDEV = weighted.mean(MLY.TMAX.STDDEV, 1/distance),
+              MLY.TMIN.STDDEV = weighted.mean(MLY.TMIN.STDDEV, 1/distance)
+              )
+
+write.csv(temps.by.zip, "Tmax-Tmin monthly normals by zip code.csv")
+```
+
+This creates a 134 MB file.
+
+# Temperature Profile Generation
+
+The next steps are to build a temperature profile for a given zip code.
+The monthly Tmaxes should occur at the middle of each month, and transition
+smoothly to one another.
+
+First a function to generate a list of days in the year.
+```{r}
+library(lubridate)
+YEAR <- 2024
+
+generate_calendar <- function(year=YEAR) {
+    #' Returns a tibble with one row per day in the input year, and columns
+    #' for the day of year, month, day, and year.
+    
+    days.per.month <-c()
+    calendar <- tibble(day.of.year=integer(), month=integer(), day=integer(),
+                       year=integer())
+    d <- 0
+    for (current.month in 1:12) {
+        n.days <- days_in_month(as.Date(paste0(current.month, "-1-", year), 
+                                        "%m-%d-%Y"))
+        new.month <- tibble(day.of.year=d, month=current.month, 
+                            day=seq(1, n.days), year=YEAR)
+        new.month$day.of.year = new.month$day + d
+        calendar <- calendar %>% bind_rows(new.month)
+        d <- tail(calendar$day.of.year, 1)
+    }
+    return(calendar)
+}
+
+```
+
+Now let's assume that the Tmax and Tmin for each month occur at the middle of 
+each month. First find the dates closest to the midpoint.
+
+```{r}
+cal <- generate_calendar(2024)
+mid.months <- cal %>% group_by(month) %>% 
+    summarize(mid.day = floor((first(day) + last(day))/2)) %>%
+    mutate(is.middle.of.month = TRUE)
+cal <- cal %>% left_join(mid.months, by=join_by(month, day==mid.day))
+cal$is.middle.of.month[is.na(cal$is.middle.of.month)] <- FALSE
+```
+
+Now interpolate between the Tmax points at the midpoints of the month.
+```{r}
+# Choose a particular zip code and get Tmax (or whatever) from temps.by.zip.
+zip <- 44140
+tdf <- temps.by.zip %>% filter(zcta == 44140)
+
+temp_splinefun <- function(days, temps) {
+    #' Returns a splinefun function that interpolates the temperature for all
+    #' the days in the year based on the input subset of days and temps.
+    #' Usually the days will be the midpoints of the months, and temp will
+    #' be monthly Tmax/Tmin normals.
+    
+    # make day periodic
+    if (tail(days,1) <= 366) {
+        days <- c(days, tail(days,1) + 31)
+        temps <- c(temps, temps[1])
+    }
+    return(splinefun(days, temps, method="periodic"))
+}
+
+days <- cal$day.of.year[cal$is.middle.of.month]
+cal <- cal %>% 
+    mutate(Tmax = temp_splinefun(days, tdf$MLY.TMAX.NORMAL)(cal$day.of.year)) %>%
+    mutate(Tmin = temp_splinefun(days, tdf$MLY.TMIN.NORMAL)(cal$day.of.year)) %>%
+    mutate(Tmax.std = temp_splinefun(days, tdf$MLY.TMAX.STDDEV)(cal$day.of.year)) %>%
+    mutate(Tmin.std = temp_splinefun(days, tdf$MLY.TMAX.STDDEV)(cal$day.of.year))
+cal <- cal %>% select(-is.middle.of.month)
+```
+
+That's how we get temperatures for every day of the year for a certain zip code.
+Putting it all together:
+```{r}
+# Notes
+# 1. temp_splinefun is defined in the previous block.
+# 2. temps.by.zip is the huge dataframe generated at the end of the 
+#    # Maping Weather to Zip section.
+
+temps.for.zip <- function(zip.code, year=YEAR, units='C') {
+    if (any("zcta" == colnames(temps.by.zip))) {
+        tdf <- temps.by.zip %>% filter(zcta == 44140)
+    } else if (any("zip.code" == colnames(temps.by.zip))) {
+        tdf <- temps.by.zip %>% filter(zip.code == 44140)
+    } else {
+        tdf <- temps.by.zip %>% filter(zip == 44140)
+    }
+    
+    cal <- generate_calendar(year)
+    mid.months <- cal %>% group_by(month) %>% 
+        summarize(mid.day = floor((first(day) + last(day))/2)) %>%
+        mutate(is.middle.of.month = TRUE)
+    cal <- cal %>% left_join(mid.months, by=join_by(month, day==mid.day))
+    cal$is.middle.of.month[is.na(cal$is.middle.of.month)] <- FALSE
+    
+    days <- cal$day.of.year[cal$is.middle.of.month]
+    cal <- cal %>% 
+        mutate(Tmax = temp_splinefun(days, tdf$MLY.TMAX.NORMAL)(cal$day.of.year)) %>%
+        mutate(Tmin = temp_splinefun(days, tdf$MLY.TMIN.NORMAL)(cal$day.of.year)) %>%
+        mutate(Tmax.std = temp_splinefun(days, tdf$MLY.TMAX.STDDEV)(cal$day.of.year)) %>%
+        mutate(Tmin.std = temp_splinefun(days, tdf$MLY.TMAX.STDDEV)(cal$day.of.year))
+    cal <- cal %>% select(-is.middle.of.month)
+    
+    if (units == 'C') {
+        cal <- cal %>% mutate(
+            Tmax = (Tmax - 32) * 5/9,
+            Tmin = (Tmin - 32) * 5/9,
+            Tmax.std = (Tmax.std - 0) * 5/9,
+            Tmin.std = (Tmin.std - 0) * 5/9
+        )
+    }
+    return(cal)
+}
+
+# Plot it up
+ggplot(cal %>% pivot_longer(cols=c("Tmax","Tmin"), 
+                            names_to = "Normal", values_to = "Temperature")) + 
+    geom_line(aes(x=day.of.year, y=Temperature, color=Normal)) + 
+    xlab("Day of Year") + ylab("Tmax/Tmin")
+```
+
+Next steps:
+- Repeat the above for daily normals. temps.by.zip will be MUCH bigger because
+it will have 365 data points per station instead of 12. Compare to monthly
+interpolated version.
+- Write function to fetch sunrise/set times from USNO website.
+- Write function for lat/lon --> sunrise/sunset (might need to determine
+    time zone for a lat/lon)
+- Spot check calculated sunrise against fetched tables
+- Figure out some measure of solar irradiance vs. time for lat/lon
+- See if weather data also has days of sun or cloudiness measure
+
+
+
+
+
+
+
+# Sunrise/Sunset Times
+
+Sunrise/sunset times can be calculated based on latitude/longitude. 
+We will use the methods described here:
+https://gml.noaa.gov/grad/solcalc/calcdetails.html
+
+The following formula is taken from a spreadsheet downloaded from the above
+website. 
+
+```{r}
+day.as.hms <- function(fraction) {
+    if (any(fraction >= 1)) return(NA)
+    hrs <- 24 * fraction
+    mins <- (hrs - floor(hrs)) * 60
+    secs = (mins - floor(mins)) * 60
+    hrs <- floor(hrs)
+    mins <- floor(mins)
+    c(hrs, mins, secs)
+}
+
+sun_times <- function(latitude, longitude, date, time.zone) {
+    #` Returns a vector with  times for sunrise, solar noon, and sunset
+    #` for input date as fractional hours.
+    
+    # date <- "2010-06-21" 
+    # time.zone <- -6    # in hours
+    # latitude <- 40     # + to North
+    # longitude <- -105  # + to East
+    time.zone <- round(lon / 15)
+    d2r <- pi/180
+    r2d <- 180/pi
+    latr <- latitude * d2r
+    lonr <- longitude * d2r
+    
+    date <- as.Date(date)
+    excel.date <- as.numeric(date - as.Date("1899-12-30", "%Y-%m-%d"))
+    hours.past.local.midnight <- (0 + 0.1) / 24 # 0:06:00
+    jul.day <- excel.date + 2415018.5 + hours.past.local.midnight - time.zone/24 # 2455368.75
+    jul.cen <- (jul.day - 2451545) / 36525    # 0.10468868
+    geom.mean.long.sun.deg <- (280.46646 
+                               + jul.cen * (36000.76983  + jul.cen * 0.0003032)) %% 360 # 89.3396
+    geom.mean.anom.sun.deg <- 357.52911 + jul.cen * (35999.05029 - 0.0001537 * jul.cen)
+    eccent.earth.orbit <- 0.016708634 - jul.cen * (0.000042037 + 0.0000001267 * jul.cen)
+    sun.eq.of.ctr <- sin(geom.mean.anom.sun.deg * d2r) * 
+        (1.914602 - jul.cen * (0.004817 + 0.000014 * jul.cen)) + 
+        sin(d2r * 2 * geom.mean.anom.sun.deg) * (0.019993 - 0.000101 * jul.cen) +
+        sin(d2r * 3 * geom.mean.anom.sun.deg) * 0.000289
+    sun.true.long.deg <- geom.mean.long.sun.deg + sun.eq.of.ctr
+    sun.true.anom.deg <- geom.mean.anom.sun.deg + sun.eq.of.ctr
+    sun.rad.vector.au <- (1.000001018 * (1 - eccent.earth.orbit * eccent.earth.orbit)) /
+        (1 + eccent.earth.orbit * cos(sun.true.anom.deg * d2r))
+    sun.app.long.deg <- sun.true.long.deg - 0.00569 - 
+        0.00478*sin(d2r*(125.04 - 1934.136 * jul.cen))
+    mean.obliq.ecliptic.deg <- 23 + 
+        (26 + ((21.448 - jul.cen * (46.815 + jul.cen * (0.00059 - jul.cen * 0.001813)))) / 60) / 60
+    obliq.corr.deg <- mean.obliq.ecliptic.deg + 
+        0.00256 * cos(d2r * (125.04 - 1934.136 * jul.cen))
+    sun.rt.ascen.deg <- r2d * (atan2(cos(d2r * sun.app.long.deg), 
+                                     cos(d2r * obliq.corr.deg) * sin(d2r * sun.app.long.deg)))
+    sun.declin.deg <- r2d * (asin(sin(d2r * obliq.corr.deg) * 
+                                      sin(d2r * sun.app.long.deg)))
+    var.y <- (tan(d2r * obliq.corr.deg / 2))^2
+    eq.of.time.min <- 4 * r2d * (var.y * sin(2 * d2r * geom.mean.long.sun.deg) - 
+                                     2 * eccent.earth.orbit * sin(d2r * geom.mean.anom.sun.deg) 
+                                 + 4 * eccent.earth.orbit * var.y * sin(d2r * geom.mean.anom.sun.deg)
+                                 * cos(2 * d2r * geom.mean.long.sun.deg) - 
+                                     0.5 * var.y^2 * sin(4 * d2r * geom.mean.long.sun.deg) - 
+                                     1.25 * eccent.earth.orbit^2 * 
+                                     sin(2 * d2r * geom.mean.anom.sun.deg))
+    ha.sunrise.deg <- r2d * (acos(cos(d2r * 90.833)/(cos(latr) 
+                                                     * cos(d2r * sun.declin.deg )) - 
+                                      tan(latr) * tan(d2r * sun.declin.deg)))
+    solar.noon.lst <- (720 - 4 * longitude - eq.of.time.min + time.zone * 60) / 1440
+    sunrise.time.lst <- solar.noon.lst - ha.sunrise.deg * 4 / 1440
+    sunset.time.lst <- solar.noon.lst + ha.sunrise.deg * 4 / 1440
+    sunlight.duration.min <- 8 * ha.sunrise.deg
+    true.solar.time.min <- hours.past.local.midnight * 1440 + 
+        eq.of.time.min + 4 * longitude - 60 * time.zone %% 1440
+    hour.angle.deg <- ifelse(true.solar.time.min/4 < 0,
+                             true.solar.time.min / 4 + 180,
+                             true.solar.time.min / 4 - 180)
+    solar.zenith.angle.deg <- r2d * acos(sin(latr) * sin(d2r * sun.declin.deg) +
+                                             cos(latr) * cos(d2r * sun.declin.deg) *
+                                             cos(d2r * hour.angle.deg))
+    solar.elevation.angle.deg <- 90 - solar.zenith.angle.deg
+    approx.atmos.refraction.deg <- if_else(solar.elevation.angle.deg>85,
+                                               0,
+                                              if_else(solar.elevation.angle.deg>5, 
+                                                      58.1/tan(d2r * solar.elevation.angle.deg) -
+                                                          0.07 / (tan(d2r * solar.elevation.angle.deg))^3 +
+                                                          0.000086 / (tan(d2r * solar.elevation.angle.deg))^5,
+                                                      if_else(solar.elevation.angle.deg > -0.575,
+                                                             1735 + solar.elevation.angle.deg * (-518.2 + solar.elevation.angle.deg * (103.4 + solar.elevation.angle.deg * (-12.79 + solar.elevation.angle.deg * 0.711))),
+                                                         -20.772 / tan(d2r * solar.elevation.angle.deg))))/3600
+        
+    solar.elevation.angle.corrected.for.atm.refraction <- 
+        solar.elevation.angle.deg + approx.atmos.refraction.deg
+        
+    solar.azimuth.angle.deg.cw.from.N <- 
+        if_else(hour.angle.deg>0, 
+                (r2d * (acos(((sin(latr)*cos(d2r * solar.zenith.angle.deg)) - 
+                                  sin(d2r * sun.declin.deg))/(cos(latr) * sin(d2r * solar.zenith.angle.deg)))) + 180) %% 360,
+                (540 - r2d * (acos(((sin(latr)*cos(d2r * (solar.zenith.angle.deg))) - sin(d2r * (sun.declin.deg)))/(cos(latr)*sin(d2r * (solar.zenith.angle.deg)))))) %% 360)
+    
+    c(sunrise=sunrise.time.lst, solarnoon=solar.noon.lst, sunset=sunset.time.lst) * 24 # in hours
+}
+
+add_sun_times <- function(df, lat, lon) {
+    times <- sapply(df$date, sun_times, lat=lat, lon=lon)
+    for (rownm in rownames(times)) {
+        df <- df %>% mutate({{rownm}} := times[rownm,])    
+    }
+    return(df)
+}
+```
+Changing the time zone but not changing the longitude moves the rise/set time
+by an hour (as expected).
+Adjusting latitude doesn't move solar noon, but increasing it makes the day
+long (sunset gets earlier, sunset gets later).
+Increasing longitude (moving east) makes solar noon, sunset, and sunrise earlier
+by the same amount.
+
+Now we'll eventually want a function that takes in a dataframe/tibble of 
+latitude/longitude points and outputs sunrise/sunset.
+
+```{r}
+generate_year <- function(year) {
+    year_seq <- seq(as.Date(paste(year, "-01-01", sep="")), 
+                    as.Date(paste(year, "-12-31", sep="")), 
+                    by="+1 day")
+    tibble(day.index=1:length(year_seq),
+           month=month(year_seq),
+           day=day(year_seq),
+           year=year(year_seq),
+           date=as.Date(paste(month, day, year, sep="/"), "%m/%d/%Y"))
+}
+```
+# Spot-Check Sunrise
+
+The USNO website gives sunrise and set times based on latitudes/longitudes. We
+can spot-check the above calculation with a few locations.
+
+First, let's write a function to pull data from the USNO website:
+```{r}
+require(httr2)
+
+lat <- 42.2
+lon <- -108.3
+
+fetch_sunrise_data <- function(lat, lon, label="Custom") {
+    utc_tz <- round(abs(lon/15))
+    tz_sgn <- sign(lon)
+    label <- sub(" ", "", label)
+    
+    # Create URL
+    url_base <- "https://aa.usno.navy.mil/calculated/rstt/year?ID=AA&year=2022&task=0"
+    url1 <- paste0("&lat=", lat, "&lon=", lon, "&label=", label)
+    url2 <- paste0("&tz=", utc_tz, "&tz_sign=", tz_sgn)
+    url_ext <- "&submit=Get+Data"
+    url <- paste0(url_base, url1, url2, url_ext)
+    
+    # Post URL request & get reponse
+    req <- request(url)
+    resp <- req_perform(req)
+    if (resp$status_code == 200) {
+        # Extract the content of the response as text
+        text <- resp_body_string(resp)
+    } else {
+        stop("Invalid USNO response.")
+    }
+    
+    # Parse response. First find the table in the returned HTML by looking
+    # for "... Jan. Feb. ..."
+    lines <- read_lines(text)
+    idx <- grep(" *Jan.* *Feb", lines, ignore.case=TRUE)
+    idx <- idx[length(idx)]  # take the last instance of "Jan..."
+    lines <- lines[idx:length(lines)]
+    # Find the end of the table by looking for the last instance of rows with
+    # "HHMM" data entries. First find the first instance of such a row (which
+    # should have 24--sunrise + sunset for each month):
+    idx1 <- grep("([0-9]{4} *){24}", lines)
+    # Now find the last row with "HHMM" entries. Since some months are shorter
+    # than others, the last row won't have 24 entries. So look for the first
+    # row without at least two instances of [0-9]{4}; that index is one past
+    # the last row.
+    idx2 <- grep("([0-9]{4} *){2}", lines)
+    idx <- tail(idx2[idx2 > idx1[length(idx1)]], 1)
+    lines <- lines[1:idx]
+    table <- paste0(lines, "\n")
+    
+    # Get the month names and double them up, since we have two columns for
+    # each month (rise/set)
+    header1 <- str_split_1(str_trim(str_replace_all(lines[1], " +", " ")), " ")
+    header1 <- as.character(1:12)
+    header1 <- str_split_1(paste(header1, header1, collapse=" "), " ")
+    header1 <- c("Day", header1)
+    header1 <- substr(header1, 1, 3)
+    # Now the rise/set header line:
+    header2 <- str_split_1(lines[2], " ")
+    header2 <- header2[header2 != ""]
+    header <- paste(header1, header2, sep="-")
+    header[1] <- str_split_1(header[1], "-")[1]
+    # There is one line that is just "h m h m h m...". Skip it, and read
+    # the rest of the table as a fixed width table. Header will be set to the
+    # vector we created above.
+    sun.df <- read_fwf(paste0(lines[-c(1,2)],"\n"), 
+                       fwf_widths(c(3, rep(c(6,5),12)), header), 
+                       skip = 1,
+                       col_types = strrep("c", 25))
+    # convert all columns to fractional hours
+    for (col in names(sun.df)[2:length(sun.df)]) {
+        sun.df <- sun.df %>% 
+            mutate({{col}} := as.numeric(substr(.data[[col]], 1, 2)) 
+                   + as.numeric(substr(.data[[col]], 3, 4)) / 60)
+    }
+    sun.df <- sun.df %>% 
+        pivot_longer(cols=-Day, 
+                     names_to=c("Month", "Var"), 
+                     names_sep = "-", 
+                     values_to = "Time")
+    sun.df <- sun.df %>%
+        mutate(Day = as.numeric(Day), Month = as.numeric(Month))
+    return(sun.df)
+}
+
+lat <- 42.2
+lon <- -108.3
+sun.df <- fetch_sunrise_data(lat, lon) %>% 
+    pivot_wider(id_cols=c("Day","Month"), 
+                names_from = "Var", values_from = "Time")
+
+# Calculated sunrise/sunset times for the year
+df <- generate_year(2024) %>%
+    add_sun_times(lat, lon) %>% 
+    left_join(sun.df, by=c("month"="Month", "day"="Day")) %>%
+    mutate(delta_sunrise = sunrise - Rise,
+           delta_sunset = sunset - Set)
+
+# df$delta_XXX is the difference between the calculated sunrise/sunset time
+# and the Rise/Set time fetched from the USNO website.
+summary(df$delta_sunrise * 60)
+summary(df$delta_sunset * 60)
+
+```
+The mean and median are both < 0.15 minutes, and the min/max are within ~2 
+minutes for sunrise and sunset. And that's for 2022 vs. 2024, so pretty good.
+
+# Extras
+
+- Cloudiness data (or days of sun)
+
+
+
+
+
+
+
+# Appendix
+
+The following is copied from:
+https://www.ncei.noaa.gov/data/normals-daily/2006-2020/doc/Readme_By-Variable_By-Station_Normals_Files.txt
+
+```{}
+Decoding a sample monthly by-variable file
+The by-variable CSV files group similar variables for all stations.  A 
+comprehensive listing of these is provided below.  For example, the file 
+ann-cldd-normal.csv contains the annual cooling degree day normals using 
+different base temperatures.  The first two lines of this file are:
+
+GHCN_ID,month,day,hour,ANN-CLDD-NORMAL,meas_flag_ANN-CLDD-NORMAL,
+comp_flag_ANN-CLDD-NORMAL,years_ANN-CLDD-NORMAL,ANN-CLDD-BASE40,
+meas_flag_ANN-CLDD-BASE40,comp_flag_ANN-CLDD-BASE40,years_ANN-CLDD-BASE40
+AQW00061705,99,99,99,  6295.4, ,S,28, 15420.4, ,S,28
+
+The first four data fields contain the GHCN-daily ID, and the applicable month,
+day, and hour.  Other station metadata is not included.  Data values are 
+provided in groups of four in the same manner as the by-station files described
+above.  Thus for this location, the annual base 65 cooling degree day normal 
+is 6295.4.  Using a base 40 measure this value is 15420.4.
+
+Measurement Flags
+M = Missing
+V = Year-round risk of frost-freeze; "too cold to compute"
+W = not used
+X = Nonzero value has rounded to zero
+Y = Insufficient values to perform computation
+Z = Computed valued created logical inconsistency with other values
+
+Completeness Flags
+S = Standard - meets WMO standards for data availability for 24 or more years 
+(missing months are filled with estimates based on surrounding stations where 
+available)
+R = Representative - meets WMO standards for data availability for 10 or more 
+years 	(missing months are filled with estimates based on surrounding stations)
+P = Provisional - meets WMO standards for data availability for 10 or more 
+years (missing months cannot be filled due to lack of surrounding stations)
+E = Estimated - meets WMO standards for data availability for 2 or more years 
+for all months (nearby stations with standard normals are available to estimate 
+normals statistically)
+
+  
+Decoding the variable names
+Variable names consist of either 15 or 23 characters.  The first three indicate 
+the timing element.  The following are possible:
+MLY, DLY, HLY = monthly, daily, hourly
+DJF, MAM, JJA, SON = seasonal, e.g. MAM is March-April-May
+ANN, MTD, YTD = annual, month-to-date, year-to-date
+
+Characters 5-8 indicate the meteorological element. The following are available:
+TMIN, TMAX  = minimum and maximum temperature
+TAVG, DUTR  = average temperature, diurnal temperature range
+CLDD, HTDD  = cooling and heating degree days
+GRDD        = growing degree days
+PRCP        = precipitation
+SNOW, SNWD  = snow and snow depth
+
+These variables are exclusive to the hourly normals:
+TEMP, DEWP = temperature and dew point
+HIDX, WCHL = heat index and wind chill
+PRES, WIND = pressure and wind
+CLDH, HTDH = cooling and heating degree hours
+CLOD       = cloud cover
+
+Characters 10-15 indicate the type of statistic.  If present, characters 16-23 
+will give more information, typically a threshold value, about the statistic.
+
+The types of statistics are:
+NORMAL = long term average
+STDDEV = long term standard deviation
+AVGNDS = average number of days meeting criteria given
+TOBADJ = time of observation bias adjustment
+
+BASE40 = with degree days, the base temperature.
+BASE45   Note that NORMAL with degree days is base 65.
+BASE50
+BASE55
+BASE57
+BASE60
+BASE70
+BASE72
+
+TB4886 = Temperature bounded growing degree days. 48 to 86.
+TB5086 = Temperature bounded growing degree days. 50 to 86.
+
+PCTALL = Probability of meeting threshold in 29-day window
+         centered on date.  Used for precipitation elements.
+
+PRBFST = Latest date on which the first frost-freeze of the cold
+         season will occur at the given probability and temperature 
+         threshold
+PRBLST = Earliest date on which the last frost-freeze of the cold 
+         season will occur given probability and temperature
+         threshold
+PRBGSL = Length of growing season with given probability and
+         temperature threshold
+
+PRBOCC = Probability of occurrence of given minimum temperature or
+         lower
+
+QUAR01 = First quartile  (25%)
+QUAR02 = Second quartile (50%)
+QUAR03 = Third quartile  (75%)
+QUIN01 = First quintile  (20%)
+QUIN02 = Second quintile (40%)
+QUIN03 = Third quintile  (60%)
+QUIN04 = Fourth quintile (80%)
+TERC01 = First tercile   (33%)
+TERC02 = Second tercile  (67%)
+
+The following are for hourly normals only
+10PCTL = 10th percentile
+90PCTL = 90th percentile
+AVGSPD = Average wind speed
+PCTCLM = Percentage of calm wind occurrences
+1STDIR = Modal wind direction (1-8) in octants clockwise from north
+1STPCT = Percentage of cases from modal direction
+2NDDIR = Second mode of wind direction
+2NDPCT = Percentage of cases from second modal direction
+VCTDIR = Average wind vector direction
+VCTSPD = Magnitude of average wind vector
+
+PCTCLR = Percentage occurrence of clouds clear
+PCTFEW = Percentage occurrence of clouds few
+PCTSCT = Percentage occurrence of clouds scattered
+PCTBKN = Percentage occurrence of clouds broken
+PCTOVC = Percentage occurrence of clouds overcast
+```
